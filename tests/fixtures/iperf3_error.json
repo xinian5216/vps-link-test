@@ -1,0 +1,46 @@
+{
+    "start": {
+        "version": "iperf 3.12",
+        "system_info": "Linux vps-b 6.1.0 #1 SMP x86_64",
+        "timestamp": {
+            "time": "Thu, 02 Oct 2026 07:00:00 GMT",
+            "timesecs": 1759308000
+        },
+        "connecting_to": {
+            "host": "203.0.113.4",
+            "port": 43821
+        },
+        "cookie": "vpsa.FOOBARBAZ",
+        "test_start": {
+            "protocol": "TCP",
+            "num_streams": 1,
+            "duration": 10
+        }
+    },
+    "intervals": [],
+    "end": {
+        "streams": [],
+        "sum_sent": {
+            "start": 0,
+            "end": 0,
+            "seconds": 0,
+            "bytes": 0,
+            "bits_per_second": 0
+        },
+        "sum_received": {
+            "start": 0,
+            "end": 0,
+            "seconds": 0,
+            "bytes": 0,
+            "bits_per_second": 0
+        },
+        "sum": {
+            "start": 0,
+            "end": 0,
+            "seconds": 0,
+            "bytes": 0,
+            "bits_per_second": 0
+        }
+    },
+    "error": "error - unable to connect to server: Connection refused"
+}

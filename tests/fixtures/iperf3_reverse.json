@@ -1,0 +1,97 @@
+{
+    "start": {
+        "connected": [
+            {
+                "socket": 4,
+                "local_host": "198.51.100.9",
+                "local_port": 51001,
+                "remote_host": "203.0.113.4",
+                "remote_port": 43821
+            }
+        ],
+        "version": "iperf 3.12",
+        "system_info": "Linux vps-a 6.1.0 #1 SMP x86_64",
+        "timestamp": {
+            "time": "Thu, 02 Oct 2026 07:05:00 GMT",
+            "timesecs": 1759311000
+        },
+        "connecting_to": {
+            "host": "203.0.113.4",
+            "port": 43821
+        },
+        "cookie": "vpsa.FOOBARBAZ",
+        "test_start": {
+            "protocol": "TCP",
+            "num_streams": 1,
+            "blksize": 131072,
+            "omit": 2,
+            "duration": 10,
+            "bytes": 0,
+            "blocks": 0,
+            "reverse": 1,
+            "tos": 0
+        }
+    },
+    "intervals": [],
+    "end": {
+        "streams": [
+            {
+                "sender": {
+                    "socket": 6,
+                    "start": 2,
+                    "end": 12.03,
+                    "seconds": 10.03,
+                    "bytes": 647000000,
+                    "bits_per_second": 516200000.0,
+                    "retransmits": 7,
+                    "max_snd_cwnd": 4194304,
+                    "max_rtt": 52,
+                    "min_rtt": 39,
+                    "mean_rtt": 42
+                },
+                "receiver": {
+                    "socket": 6,
+                    "start": 2,
+                    "end": 12.03,
+                    "seconds": 10.03,
+                    "bytes": 646900000,
+                    "bits_per_second": 517800000.0
+                }
+            }
+        ],
+        "sum_sent": {
+            "start": 2,
+            "end": 12.03,
+            "seconds": 10.03,
+            "bytes": 647000000,
+            "bits_per_second": 516200000.0,
+            "retransmits": 7
+        },
+        "sum_received": {
+            "start": 2,
+            "end": 12.03,
+            "seconds": 10.03,
+            "bytes": 646900000,
+            "bits_per_second": 517800000.0
+        },
+        "sum": {
+            "start": 2,
+            "end": 12.03,
+            "seconds": 10.03,
+            "bytes": 647000000,
+            "bits_per_second": 517800000.0,
+            "retransmits": 7
+        },
+        "cpu_utilization_percent": {
+            "host_total": 4.1,
+            "host_user": 1.4,
+            "host_system": 2.7,
+            "remote_total": 5.2,
+            "remote_user": 2.1,
+            "remote_system": 3.1
+        },
+        "sender_tcp_congestion": "bbr",
+        "receiver_tcp_congestion": "bbr"
+    },
+    "error": null
+}
