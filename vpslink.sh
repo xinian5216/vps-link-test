@@ -1137,29 +1137,22 @@ run_ping_test() {
         timeout 40 ping -n -c "$PING_COUNT" -W 2 "$target" >"$out" 2>&1 || true
     fi
 
-    # Without the summary line, ICMP is filtered or the host is unreachable.
-    summary="$(grep -E 'packets transmitted' "$out" 2>/dev/null | tail -n 1)"
-    if [[ -z "$summary" ]]; then
-        PING_STATUS="filtered"
-        return 1
-    fi
+    # Parsing lives in its own function so it can be unit tested from a
+    # fixture without ever running ping (see tests/test_parsers.sh).
+    local facts=""
+    facts="$(parse_ping_file "$out")"
+    PING_STATUS="$(parse_field "$facts" status)"
+    PING_LOSS="$(parse_field "$facts" loss)"
+    PING_MIN="$(parse_field "$facts" min)"
+    PING_AVG="$(parse_field "$facts" avg)"
+    PING_MAX="$(parse_field "$facts" max)"
+    PING_MDEV="$(parse_field "$facts" mdev)"
 
-    PING_LOSS="$(printf '%s\n' "$summary" | sed -n 's/.*[^0-9.]\([0-9][0-9.]*\)% packet loss.*/\1/p')"
-    [[ -n "$PING_LOSS" ]] || PING_LOSS=""
-
-    rttline="$(grep -E 'min/avg/max/mdev' "$out" 2>/dev/null | tail -n 1)"
-    if [[ -n "$rttline" ]]; then
-        vals="$(printf '%s\n' "$rttline" | sed -n 's#.*= *\([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\).*#\1 \2 \3 \4#p')"
-    fi
-    if [[ -n "$vals" ]]; then
-        read -r PING_MIN PING_AVG PING_MAX PING_MDEV <<<"$vals"
-        PING_STATUS="ok"
-        return 0
-    fi
-
-    # A summary line with no RTT samples means everything was lost.
-    PING_STATUS="loss"
-    return 0
+    case "$PING_STATUS" in
+        ok)   return 0 ;;
+        loss) return 0 ;;
+        *)    return 1 ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -1190,32 +1183,18 @@ mtr_can_use_sudo() {
     sudo -n true >/dev/null 2>&1
 }
 
-# Sets MTR_HOPS and MTR_TARGET_LOSS from whichever report format we got.
-# Only the target is treated as a measurement of the link.
+# Sets MTR_HOPS, MTR_TARGET_LOSS and MTR_MODE from whatever report we got.
+# Only the target row is treated as a measurement of the link.
 extract_mtr_facts() {
-    local out="$1" mode="$2" n="" loss=""
-
+    local out="$1" facts=""
     MTR_HOPS=""
     MTR_TARGET_LOSS=""
+    MTR_MODE=""
 
-    if [[ "$mode" == "json" ]] && command -v jq >/dev/null 2>&1; then
-        if jq -e '.report.hubs' "$out" >/dev/null 2>&1; then
-            n="$(jq -r '.report.hubs | length' "$out" 2>/dev/null)"
-            loss="$(jq -r '.report.hubs[-1]["Loss%"] // empty' "$out" 2>/dev/null)"
-        fi
-    fi
-    if [[ -z "$n" ]]; then
-        # Plain report: rows start with "<n>.|--"; the last row is the target.
-        n="$(awk '/^[[:space:]]*[0-9]+\./ {last=$3; c++} END {print c" "last}' \
-             "$out" 2>/dev/null)"
-        loss="$(printf '%s\n' "$n" | awk '{print $2}')"
-        n="$(printf '%s\n' "$n" | awk '{print $1}')"
-        loss="${loss%\%}"
-    else
-        loss="${loss%\%}"
-    fi
-    [[ -n "$n" && "$n" != "0" ]] && MTR_HOPS="$n"
-    [[ -n "$loss" ]] && MTR_TARGET_LOSS="$loss"
+    facts="$(parse_mtr_file "$out")"
+    MTR_HOPS="$(parse_field "$facts" hops)"
+    MTR_TARGET_LOSS="$(parse_field "$facts" target_loss)"
+    MTR_MODE="$(parse_field "$facts" mode)"
     return 0
 }
 
@@ -1278,7 +1257,7 @@ iperf3_has_option() {
 run_iperf3_test() {
     local label="$1" out="$2" reverse="$3"
     local -a args=(-c "$RESOLVED_ADDR" -p "$A_PORT" -t "$IPERF_DURATION")
-    local err="" jbps="" retr="" secs="" mbps=""
+    local err="" retr="" secs="" mbps=""
 
     if ! command -v iperf3 >/dev/null 2>&1; then
         printf 'iperf3 is not available\n'
@@ -1306,38 +1285,23 @@ run_iperf3_test() {
     local rc=$?
     [[ -s "$out" ]] || printf 'iperf3: error - exited with code %s and produced no output\n' "$rc" >"$out"
 
-    # A connection failure usually shows up as plain text on stderr, not JSON.
-    if ! jq -e . "$out" >/dev/null 2>&1; then
-        err="$(grep -E 'iperf3: error|unable to connect|Connection refused|timed out' \
-               "$out" 2>/dev/null | head -n 1)"
-        [[ -n "$err" ]] || err="iperf3 exited with code ${rc} and produced no JSON"
-        printf '%s\n' "$err"
+    # Parsing lives in its own function so it can be unit tested from a
+    # fixture without ever running iperf3 (see tests/test_parsers.sh).
+    local facts="" status="" message=""
+    facts="$(parse_iperf3_file "$out")"
+    status="$(parse_field "$facts" status)"
+
+    if [[ "$status" != "ok" ]]; then
+        message="$(parse_field "$facts" error)"
+        [[ -n "$message" ]] || message="iperf3 reported exit code ${rc} with no usable result"
+        printf '%s\n' "$message"
         return 1
     fi
 
-    err="$(jq -r '.error // empty' "$out" 2>/dev/null)"
-    if [[ -n "$err" ]]; then
-        printf '%s\n' "$err"
-        return 1
-    fi
-
-    jbps="$(jq -r '
-        [ .end.sum.bits_per_second,
-          .end.sum_received.bits_per_second,
-          .end.sum_sent.bits_per_second ] | map(select(. != null)) | first // empty
-    ' "$out" 2>/dev/null)"
-    if [[ -z "$jbps" || "$jbps" == "null" ]]; then
-        printf 'iperf3: error - no throughput value found in the JSON result\n'
-        return 1
-    fi
-
-    retr="$(jq -r '
-        [ .end.sum_sent.retransmits, .end.sum.retransmits ] | map(select(. != null)) | first // empty
-    ' "$out" 2>/dev/null)"
-    secs="$(jq -r '.end.sum.seconds // empty' "$out" 2>/dev/null)"
-
-    mbps="$(awk -v b="$jbps" 'BEGIN { printf "%.1f", b / 1000000 }')"
-    printf '%s %s %s\n' "$mbps" "${retr:-n/a}" "${secs:-n/a}"
+    printf '%s %s %s\n' \
+        "$(parse_field "$facts" mbps)" \
+        "$(parse_field "$facts" retransmits)" \
+        "$(parse_field "$facts" seconds)"
     return 0
 }
 
@@ -1465,10 +1429,403 @@ info "  Status         ${IPERF_BA_STATUS}"
 info "  Status         ${IPERF_AB_STATUS}"
 
     step_header 6 "Analyze"
-    info "  Results captured; the parser and report layer come next."
+    analyze_results
 
     step_header 7 "Report"
-    info "  Raw files for this run are kept in ${WORKDIR}."
+    print_report
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Result parsing
+#
+# Every parser below is a pure function of one output file and prints simple
+# "key=value" lines. That makes them unit testable from the fixtures in
+# tests/fixtures without running ping, mtr or iperf3 at all.
+#
+# The localized, human readable output of these tools is deliberately never
+# used as the primary parser: iperf3 is parsed from -J JSON, mtr from --json
+# with a plain text fallback, and ping from the one line that is stable across
+# iputils versions (and forced into English by the global LC_ALL=C).
+# ---------------------------------------------------------------------------
+
+# parse_field <"key=value" lines> <key> -> value (empty if absent)
+parse_field() {
+    printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1
+}
+
+# Formats a number to one decimal place; anything else is passed through.
+fmt1() {
+    if [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+        awk -v x="$1" 'BEGIN { printf "%.1f", x }'
+    else
+        printf '%s' "${1:-?}"
+    fi
+}
+
+# True when the numeric value of $1 is strictly greater than $2.
+num_gt() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 > b + 0) }'
+}
+
+# ---------------------------------------------------------------------------
+# Ping
+#   status=ok      at least one echo reply with RTT samples
+#           loss   100% loss: a summary line but no RTT samples
+#           fail   no summary line at all (filtered, unreachable, tool error)
+# ---------------------------------------------------------------------------
+
+parse_ping_file() {
+    local f="$1" summary="" rttline="" vals="" loss="" status="fail"
+    local a="" b="" c="" d=""
+
+    if [[ ! -r "$f" ]]; then
+        printf 'status=fail\n'
+        return 0
+    fi
+
+    summary="$(grep -E 'packets transmitted' "$f" 2>/dev/null | tail -n 1)"
+    if [[ -z "$summary" ]]; then
+        printf 'status=fail\n'
+        return 0
+    fi
+
+    loss="$(printf '%s\n' "$summary" \
+            | sed -n 's/.*[^0-9.]\([0-9][0-9.]*\)% packet loss.*/\1/p')"
+
+    rttline="$(grep -E 'min/avg/max/mdev' "$f" 2>/dev/null | tail -n 1)"
+    if [[ -n "$rttline" ]]; then
+        # rtt min/avg/max/mdev = 38.412/40.700/46.200/1.804 ms
+        vals="$(printf '%s\n' "$rttline" \
+                | sed -n 's#.*= *\([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\).*#\1 \2 \3 \4#p')"
+    fi
+
+    if [[ -n "$vals" ]]; then
+        read -r a b c d <<<"$vals"
+        status="ok"
+    else
+        status="loss"
+    fi
+
+    printf 'status=%s\n' "$status"
+    printf 'loss=%s\n' "${loss:-}"
+    printf 'min=%s\n' "$a"
+    printf 'avg=%s\n' "$b"
+    printf 'max=%s\n' "$c"
+    printf 'mdev=%s\n' "$d"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# iperf3 (JSON first, plain text only for the error message)
+#   status=ok | error | parse_error
+# ---------------------------------------------------------------------------
+
+parse_iperf3_file() {
+    local f="$1" err="" bps="" retr="" secs="" mbps=""
+
+    if [[ ! -s "$f" ]]; then
+        printf 'status=parse_error\n'
+        printf 'error=no iperf3 output was captured\n'
+        return 0
+    fi
+
+    if ! jq -e . "$f" >/dev/null 2>&1; then
+        # A failure to connect usually lands on stderr as plain text.
+        err="$(grep -E 'iperf3: error|unable to connect|Connection refused|timed out|No route' \
+               "$f" 2>/dev/null | head -n 1)"
+        [[ -n "$err" ]] || err='iperf3 produced no JSON output'
+        printf 'status=error\n'
+        printf 'error=%s\n' "$err"
+        return 0
+    fi
+
+    err="$(jq -r '.error // empty' "$f" 2>/dev/null)"
+    if [[ -n "$err" ]]; then
+        printf 'status=error\n'
+        printf 'error=%s\n' "$err"
+        return 0
+    fi
+
+    # One single stream, so any of these describes the test; prefer the
+    # aggregate, then the receiver view, then the sender view.
+    bps="$(jq -r '
+        [ .end.sum.bits_per_second,
+          .end.sum_received.bits_per_second,
+          .end.sum_sent.bits_per_second ]
+        | map(select(. != null and . != 0)) | first // empty
+    ' "$f" 2>/dev/null)"
+    if [[ -z "$bps" || "$bps" == "null" ]]; then
+        printf 'status=parse_error\n'
+        printf 'error=no throughput value found in the iperf3 result\n'
+        return 0
+    fi
+
+    retr="$(jq -r '
+        [ .end.sum_sent.retransmits, .end.sum.retransmits ]
+        | map(select(. != null)) | first // empty
+    ' "$f" 2>/dev/null)"
+    secs="$(jq -r '.end.sum.seconds // empty' "$f" 2>/dev/null)"
+    mbps="$(awk -v b="$bps" 'BEGIN { printf "%.1f", b / 1000000 }')"
+
+    printf 'status=ok\n'
+    printf 'mbps=%s\n' "$mbps"
+    printf 'retransmits=%s\n' "${retr:-}"
+    printf 'seconds=%s\n' "${secs:-}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# MTR
+#   mode=json | text
+#   hops / target_loss describe the last (target) row ONLY. Intermediate hop
+#   loss is deliberately ignored: a router rate limiting ICMP says nothing
+#   about the link to the destination.
+# ---------------------------------------------------------------------------
+
+parse_mtr_file() {
+    local f="$1" mode="text" n="" loss="" parsed=""
+
+    if [[ ! -s "$f" ]]; then
+        printf 'status=fail\n'
+        printf 'mode=none\n'
+        printf 'hops=0\n'
+        printf 'target_loss=\n'
+        return 0
+    fi
+
+    if jq -e '.report.hubs' "$f" >/dev/null 2>&1; then
+        mode="json"
+        n="$(jq -r '.report.hubs | length' "$f" 2>/dev/null)"
+        loss="$(jq -r '.report.hubs[-1]["Loss%"] // empty' "$f" 2>/dev/null)"
+    fi
+
+    if [[ -z "$n" || "$n" == "null" ]]; then
+        # Plain report: rows look like "  1.|-- 10.0.0.1   0.0%  20  ...".
+        mode="text"
+        parsed="$(awk '/^[[:space:]]*[0-9]+\./ { last = $3; c++ } END { print c+0, last }' \
+                  "$f" 2>/dev/null)"
+        n="$(printf '%s\n' "$parsed" | awk '{print $1}')"
+        loss="$(printf '%s\n' "$parsed" | awk '{print $2}')"
+    fi
+
+    loss="${loss%\%}"
+    [[ -n "$n" && "$n" != "0" && "$n" != "null" ]] || n="0"
+
+    printf 'status=ok\n'
+    printf 'mode=%s\n' "$mode"
+    printf 'hops=%s\n' "$n"
+    printf 'target_loss=%s\n' "${loss:-}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Analysis
+#
+# Rules are intentionally boring and transparent so anyone can re-derive the
+# verdict from the numbers above them. There is no composite 0-100 score, and
+# a route is never judged on absolute RTT alone: a transatlantic link has a
+# naturally high RTT and that is not a fault.
+#
+# Stability:
+#   packet loss > 0                    -> "Packet loss detected"
+#   loss == 0 and RTT variation > 50 ms -> "Unstable"
+#   loss == 0 and RTT variation > 5 ms  -> "Normal"
+#   loss == 0 and RTT variation <= 5 ms -> "Good"
+#   no ping at all                     -> "Unknown"
+# ---------------------------------------------------------------------------
+
+CONNECTIVITY_STATUS="Unknown"
+STABILITY_STATUS="Unknown"
+PACKET_LOSS_TEXT="Unknown"
+COMPARISON_TEXT=""
+PING_UNAVAILABLE_NOTE=""
+
+analyze_results() {
+    CONNECTIVITY_STATUS="Unknown"
+    STABILITY_STATUS="Unknown"
+    PACKET_LOSS_TEXT="Unknown"
+    COMPARISON_TEXT=""
+    PING_UNAVAILABLE_NOTE=""
+
+    local any_tcp=0
+    [[ "$IPERF_BA_STATUS" == "ok" ]] && any_tcp=1
+    [[ "$IPERF_AB_STATUS" == "ok" ]] && any_tcp=1
+
+    local ping_worked=""
+    [[ "$PING_STATUS" == "ok" || "$PING_STATUS" == "loss" ]] && ping_worked=1
+
+    # Connectivity: did the target answer over either mechanism?
+    if [[ -n "$ping_worked" || $any_tcp -eq 1 ]]; then
+        CONNECTIVITY_STATUS="Normal"
+    else
+        CONNECTIVITY_STATUS="Failed"
+    fi
+    if [[ -z "$ping_worked" && $any_tcp -eq 1 ]]; then
+        PING_UNAVAILABLE_NOTE="Ping: unavailable / filtered"
+    fi
+
+    # Packet loss comes only from the ping summary line.
+    if [[ -n "$ping_worked" ]]; then
+        if num_gt "${PING_LOSS:-0}" 0; then
+            PACKET_LOSS_TEXT="$(fmt1 "$PING_LOSS") %"
+        else
+            PACKET_LOSS_TEXT="None"
+        fi
+    else
+        PACKET_LOSS_TEXT="Unknown"
+    fi
+
+    # Stability.
+    if [[ -z "$ping_worked" ]]; then
+        STABILITY_STATUS="Unknown"
+    elif [[ "$PACKET_LOSS_TEXT" != "None" ]]; then
+        STABILITY_STATUS="Packet loss detected"
+    elif num_gt "${PING_MDEV:-0}" 50; then
+        STABILITY_STATUS="Unstable"
+    elif num_gt "${PING_MDEV:-0}" 5; then
+        STABILITY_STATUS="Normal"
+    else
+        STABILITY_STATUS="Good"
+    fi
+
+    # Throughput comparison, only when both directions actually measured.
+    if [[ "$IPERF_BA_STATUS" == "ok" && "$IPERF_AB_STATUS" == "ok" ]]; then
+        local ba="$IPERF_BA_MBPS" ab="$IPERF_AB_MBPS" pct=""
+        if num_gt "$ab" "$(awk -v b="$ba" 'BEGIN { printf "%.1f", b * 1.10 }')"; then
+            pct="$(awk -v a="$ab" -v b="$ba" 'BEGIN { printf "%.0f", (a - b) / b * 100 }')"
+            COMPARISON_TEXT="A -> B throughput is approximately
+  ${pct}% higher than B -> A."
+        elif num_gt "$ba" "$(awk -v a="$ab" 'BEGIN { printf "%.1f", a * 1.10 }')"; then
+            pct="$(awk -v a="$ba" -v b="$ab" 'BEGIN { printf "%.0f", (a - b) / b * 100 }')"
+            COMPARISON_TEXT="B -> A throughput is approximately
+  ${pct}% higher than A -> B."
+        else
+            COMPARISON_TEXT="Both directions are within 10% of each other."
+        fi
+    elif [[ $any_tcp -eq 1 ]]; then
+        COMPARISON_TEXT="Only one direction completed, so no comparison is possible."
+    else
+        COMPARISON_TEXT="No throughput measurement completed."
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+print_report() {
+    local line="========================================"
+    local subsection="----------------------------------------"
+
+    printf '%s\n' "$line"
+    printf '            VPS Link Test\n'
+    printf '%s\n' "$line"
+    printf '\n'
+
+    printf 'Target\n'
+    printf '  %-16s %s\n' "Address" "${RESOLVED_ADDR:-unknown}"
+    printf '  %-16s %s\n' "Protocol" "${RESOLVED_FAMILY:-unknown}"
+    printf '\n'
+
+    printf 'Latency\n'
+    case "$PING_STATUS" in
+        ok)
+            printf '  %-16s %s ms\n'  "Min"            "$(fmt1 "${PING_MIN:-}")"
+            printf '  %-16s %s ms\n'  "Avg"            "$(fmt1 "${PING_AVG:-}")"
+            printf '  %-16s %s ms\n'  "Max"            "$(fmt1 "${PING_MAX:-}")"
+            printf '  %-16s %s ms\n'  "RTT variation"  "$(fmt1 "${PING_MDEV:-}")"
+            printf '  %-16s %s %%\n' "Packet loss"    "$(fmt1 "${PING_LOSS:-0}")"
+            ;;
+        loss)
+            printf '  %-16s %s %%\n' "Packet loss" "$(fmt1 "${PING_LOSS:-0}")"
+            printf '  %-16s %s\n'    "Min / Avg / Max" "no RTT samples"
+            printf '  %-16s %s\n'    "RTT variation"   "no RTT samples"
+            ;;
+        *)
+            printf '  %-16s %s\n' "Min"           "unavailable"
+            printf '  %-16s %s\n' "Avg"           "unavailable"
+            printf '  %-16s %s\n' "Max"           "unavailable"
+            printf '  %-16s %s\n' "RTT variation" "unavailable"
+            printf '  %-16s %s\n' "Packet loss"   "unavailable"
+            ;;
+    esac
+    printf '\n'
+
+    printf 'Route\n'
+    if [[ "$MTR_STATUS" == "ok" ]]; then
+        printf '  %-16s %s\n' "Hops"        "${MTR_HOPS:-unknown}"
+        printf '  %-16s %s %%\n' "Target loss" "$(fmt1 "${MTR_TARGET_LOSS:-}")"
+    else
+        printf '  %-16s %s\n' "Hops"         "unavailable"
+        printf '  %-16s %s\n' "Target loss"  "unavailable"
+    fi
+    printf '\n'
+
+    printf 'TCP Throughput\n'
+    if [[ "$IPERF_BA_STATUS" == "ok" ]]; then
+        printf '  %-16s %s Mbps\n' "B -> A" "$(fmt1 "$IPERF_BA_MBPS")"
+    else
+        printf '  %-16s %s\n' "B -> A" "unavailable"
+    fi
+    if [[ "$IPERF_AB_STATUS" == "ok" ]]; then
+        printf '  %-16s %s Mbps\n' "A -> B" "$(fmt1 "$IPERF_AB_MBPS")"
+    else
+        printf '  %-16s %s\n' "A -> B" "unavailable"
+    fi
+    printf '\n'
+
+    printf 'TCP Retransmits\n'
+    if [[ "$IPERF_BA_STATUS" == "ok" ]]; then
+        printf '  %-16s %s\n' "B -> A" "${IPERF_BA_RETRANS:-n/a}"
+    else
+        printf '  %-16s %s\n' "B -> A" "unavailable"
+    fi
+    if [[ "$IPERF_AB_STATUS" == "ok" ]]; then
+        printf '  %-16s %s\n' "A -> B" "${IPERF_AB_RETRANS:-n/a}"
+    else
+        printf '  %-16s %s\n' "A -> B" "unavailable"
+    fi
+    printf '\n'
+
+    printf '%s\n' "$subsection"
+    printf '\n'
+    printf 'Result\n'
+    printf '\n'
+    printf '  %-16s %s\n' "Connectivity" "$CONNECTIVITY_STATUS"
+    printf '  %-16s %s\n' "Stability"    "$STABILITY_STATUS"
+    printf '  %-16s %s\n' "Packet loss"  "$PACKET_LOSS_TEXT"
+    printf '\n'
+
+    if [[ -n "$COMPARISON_TEXT" ]]; then
+        printf '%s\n' "$COMPARISON_TEXT"
+        printf '\n'
+    fi
+
+    # Notes keep the report honest about what the numbers do and do not mean.
+    printf '%s\n' "$subsection"
+    printf '\n'
+    printf 'Observed TCP throughput is a single TCP stream over one direction.\n'
+    printf 'It is not the port bandwidth of either VPS.\n'
+    if [[ "$PING_STATUS" == "ok" || "$PING_STATUS" == "loss" ]]; then
+        printf 'RTT variation is the ping mdev value. It is not a strict jitter\n'
+        printf 'measurement.\n'
+    fi
+    if [[ "$MTR_STATUS" == "ok" ]]; then
+        printf 'Route loss is taken from the target only. Intermediate hops are\n'
+        printf 'not counted, because they often rate limit ICMP.\n'
+    fi
+    if [[ -n "$PING_UNAVAILABLE_NOTE" ]]; then
+        printf '%s\n' "$PING_UNAVAILABLE_NOTE"
+    fi
+    if [[ "$IPERF_BA_STATUS" != "ok" || "$IPERF_AB_STATUS" != "ok" ]]; then
+        printf 'A missing value means that step failed. Check the step output\n'
+        printf 'above for the reason.\n'
+    fi
+    printf '\n'
+    printf '%s\n' "$line"
     return 0
 }
 
