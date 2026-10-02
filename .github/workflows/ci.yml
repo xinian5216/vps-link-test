@@ -18,18 +18,136 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    name: Syntax and ShellCheck
+  syntax:
+    name: Bash syntax
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Show shellcheck version
-        run: shellcheck --version
-
-      - name: Bash syntax check
+      - name: bash -n vpslink.sh
         run: bash -n vpslink.sh
 
+      - name: bash -n tests/*.sh
+        run: |
+          for f in tests/*.sh; do
+            bash -n "$f"
+          done
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Make sure ShellCheck is available
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --version
+
+      # Strictest level: findings at style level are treated as errors.
       - name: ShellCheck
-        run: shellcheck --severity=style vpslink.sh
+        run: shellcheck --severity=style --external-sources --source-path=tests vpslink.sh tests/test_parsers.sh
+
+  parser-tests:
+    name: Parser fixture tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Make sure jq is available
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends jq
+          fi
+          jq --version
+
+      # Runs entirely offline: every parser is driven from tests/fixtures.
+      # No iperf3 server, no ping, no mtr, no public network traffic.
+      - name: Run parser tests
+        run: bash tests/test_parsers.sh
+
+      - name: Every fixture must be present
+        run: |
+          for f in ping_success.txt ping_loss.txt ping_fail.txt \
+                   iperf3_normal.json iperf3_reverse.json iperf3_error.json \
+                   mtr_json.json mtr_text.txt; do
+            test -r "tests/fixtures/$f" || { echo "missing: $f"; exit 1; }
+          done
+
+  no-real-network:
+    name: Non-interactive smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Proves the script boots, resolves the distro, declines the optional
+      # dependency install and exits cleanly, and that piping the output never
+      # leaks ANSI escape codes. No server is started and no throughput test
+      # is performed.
+      - name: Boot, show environment, exit
+        run: |
+          out="$(printf 'n\n3\n\n0\n' | VPSLINK_SKIP_IP_DETECT=1 bash vpslink.sh 2>&1)"
+          printf '%s\n' "$out"
+          if printf '%s' "$out" | grep -q $'\033'; then
+            echo "FAIL: ANSI escape codes leaked into piped output"
+            exit 1
+          fi
+
+  production-safety:
+    name: Production safety scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # The script runs on real production VPSes, so the source itself must
+      # never contain a command that reboots the box, restarts a service,
+      # rewrites networking or firewalling, kills unrelated processes, or
+      # upgrades/removes packages. Comments are stripped first, because they
+      # legitimately say things like "we never call pkill".
+      - name: No system-modifying command in code
+        run: |
+          set -o pipefail
+          hits="$(sed 's/#.*//' vpslink.sh \
+            | grep -nE '(^|[|&;`$ (])?(reboot|systemctl|service +(start|stop|restart|reload)|/(etc/)?sshd_config|sysctl +-w|iptables|nftables|ufw|firewall-cmd|nmcli|resolv.conf|pkill|killall|autoremove|dist-upgrade)([ ;|&)]|$)' \
+            || true)"
+          if [ -n "$hits" ]; then
+            echo "FAIL: forbidden command found:"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: No package upgrade or autoremove
+        run: |
+          set -o pipefail
+          hits="$(sed 's/#.*//' vpslink.sh \
+            | grep -nE '(apt-get|apt|dnf|yum) +(upgrade|dist-upgrade|autoremove)' \
+            || true)"
+          if [ -n "$hits" ]; then
+            echo "FAIL: an upgrade/autoremove command found:"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: The documented temp directory template is used
+        run: |
+          echo "mktemp uses:"
+          grep -n 'mktemp -d' vpslink.sh
+          count="$(grep -c 'mktemp -d' vpslink.sh)"
+          if [ "$count" -ne 1 ]; then
+            echo "FAIL: expected exactly one 'mktemp -d' call, found $count"
+            exit 1
+          fi
+          grep -q 'vps-link-test-XXXXXXXX' vpslink.sh \
+            || { echo "FAIL: expected the /tmp/vps-link-test-XXXXXXXX template"; exit 1; }
+          echo "OK"
