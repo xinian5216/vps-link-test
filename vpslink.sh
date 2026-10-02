@@ -982,9 +982,493 @@ run_mode_a() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# B mode - drive the tests against the A side
+#
+# Order is fixed:
+#   1. Connectivity preparation
+#   2. Ping
+#   3. MTR
+#   4. TCP throughput B -> A
+#   5. TCP throughput A -> B
+#   6. Analyze
+#   7. Report
+#
+# A single failing step must never abort the run: every step records a status
+# and a human readable reason, and the report prints whatever is available.
+#
+# The *_STATUS / *_MBPS / ... variables below are the contract with the report
+# layer, so they are written here and read there.
+# shellcheck disable=SC2034
+# ---------------------------------------------------------------------------
+
+PING_COUNT=20
+MTR_CYCLES=20
+IPERF_DURATION=10
+IPERF_OMIT=2
+
+# Resolved target, shared with the report.
+RESOLVED_ADDR=""
+RESOLVED_FAMILY=""
+A_PORT=""
+
+# Ping results.
+PING_STATUS="not run"       # ok | loss | filtered | unavailable
+PING_LOSS=""
+PING_MIN=""
+PING_AVG=""
+PING_MAX=""
+PING_MDEV=""
+
+# MTR results.
+MTR_STATUS="not run"        # ok | unavailable | filtered
+MTR_HOPS=""
+MTR_TARGET_LOSS=""
+MTR_MODE=""                 # json | text
+
+# iperf3 results.
+IPERF_BA_STATUS="not run"   # ok | error | unavailable
+IPERF_BA_MBPS=""
+IPERF_BA_RETRANS=""
+IPERF_BA_SECONDS=""
+IPERF_BA_ERROR=""
+IPERF_AB_STATUS="not run"
+IPERF_AB_MBPS=""
+IPERF_AB_RETRANS=""
+IPERF_AB_SECONDS=""
+IPERF_AB_ERROR=""
+
+validate_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
+}
+
+# Resolves a target into one address plus the family actually used. If a
+# hostname has both A and AAAA records the user picks the protocol.
+resolve_target() {
+    local host="$1" addr=""
+    local -a v4=() v6=() all=()
+
+    if is_ipv4 "$host"; then
+        RESOLVED_ADDR="$host"
+        RESOLVED_FAMILY="IPv4"
+        return 0
+    fi
+    if is_ipv6_literal "$host"; then
+        RESOLVED_ADDR="$host"
+        RESOLVED_FAMILY="IPv6"
+        return 0
+    fi
+
+    if ! command -v getent >/dev/null 2>&1; then
+        fail "getent is not available, so hostnames cannot be resolved."
+        info "Enter an IPv4 or IPv6 literal instead."
+        return 1
+    fi
+
+    while IFS= read -r addr; do
+        [[ -n "$addr" ]] && all+=("$addr")
+    done < <(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+
+    if [[ ${#all[@]} -eq 0 ]]; then
+        fail "Could not resolve '${host}'."
+        info "Check the spelling, or enter an IP address instead."
+        return 1
+    fi
+
+    for addr in "${all[@]}"; do
+        if is_ipv4 "$addr"; then
+            v4+=("$addr")
+        elif is_ipv6_literal "$addr"; then
+            v6+=("$addr")
+        fi
+    done
+
+    if [[ ${#v4[@]} -gt 0 && ${#v6[@]} -gt 0 ]]; then
+        printf '\n'
+        info "'${host}' resolves to both IPv4 and IPv6:"
+        info "  1. IPv4  ${v4[0]}"
+        info "  2. IPv6  ${v6[0]}"
+        local choice=""
+        choice="$(read_line "Test over which protocol? [1/2] (default 1): ")"
+        case "$choice" in
+            2) RESOLVED_ADDR="${v6[0]}"; RESOLVED_FAMILY="IPv6" ;;
+            *) RESOLVED_ADDR="${v4[0]}"; RESOLVED_FAMILY="IPv4" ;;
+        esac
+        return 0
+    fi
+
+    if [[ ${#v4[@]} -gt 0 ]]; then
+        RESOLVED_ADDR="${v4[0]}"
+        RESOLVED_FAMILY="IPv4"
+        return 0
+    fi
+    if [[ ${#v6[@]} -gt 0 ]]; then
+        RESOLVED_ADDR="${v6[0]}"
+        RESOLVED_FAMILY="IPv6"
+        return 0
+    fi
+
+    fail "No usable IPv4 or IPv6 address found for '${host}'."
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Step 2: Ping
+# ---------------------------------------------------------------------------
+
+run_ping_test() {
+    local target="$1" family="$2" out="$WORKDIR/ping.txt"
+    local summary="" rttline="" vals=""
+
+    PING_STATUS="unavailable"
+
+    if ! command -v ping >/dev/null 2>&1; then
+        return 1
+    fi
+
+    info "Pinging ${target} ${PING_COUNT} times ..."
+
+    # iputils picks the address family from a literal on modern versions, but
+    # older builds need an explicit -6, so try that first and fall back.
+    if [[ "$family" == "IPv6" ]]; then
+        timeout 40 ping -6 -n -c "$PING_COUNT" -W 2 "$target" >"$out" 2>&1 || true
+        [[ -s "$out" ]] || timeout 40 ping -n -c "$PING_COUNT" -W 2 "$target" >"$out" 2>&1 || true
+    else
+        timeout 40 ping -n -c "$PING_COUNT" -W 2 "$target" >"$out" 2>&1 || true
+    fi
+
+    # Without the summary line, ICMP is filtered or the host is unreachable.
+    summary="$(grep -E 'packets transmitted' "$out" 2>/dev/null | tail -n 1)"
+    if [[ -z "$summary" ]]; then
+        PING_STATUS="filtered"
+        return 1
+    fi
+
+    PING_LOSS="$(printf '%s\n' "$summary" | sed -n 's/.*[^0-9.]\([0-9][0-9.]*\)% packet loss.*/\1/p')"
+    [[ -n "$PING_LOSS" ]] || PING_LOSS=""
+
+    rttline="$(grep -E 'min/avg/max/mdev' "$out" 2>/dev/null | tail -n 1)"
+    if [[ -n "$rttline" ]]; then
+        vals="$(printf '%s\n' "$rttline" | sed -n 's#.*= *\([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\).*#\1 \2 \3 \4#p')"
+    fi
+    if [[ -n "$vals" ]]; then
+        read -r PING_MIN PING_AVG PING_MAX PING_MDEV <<<"$vals"
+        PING_STATUS="ok"
+        return 0
+    fi
+
+    # A summary line with no RTT samples means everything was lost.
+    PING_STATUS="loss"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Step 3: MTR
+# ---------------------------------------------------------------------------
+
+mtr_help() {
+    mtr --help 2>&1 || true
+}
+
+mtr_json_flag() {
+    local help
+    help="$(mtr_help)"
+    if printf '%s\n' "$help" | grep -q -- '--json'; then
+        printf -- '--json'
+    elif printf '%s\n' "$help" | grep -q -- ' -j '; then
+        printf -- '-j'
+    else
+        printf ''
+    fi
+}
+
+# mtr needs raw sockets; a non-root user may be allowed to use them anyway.
+# If that fails, try sudo -n exactly once.
+mtr_can_use_sudo() {
+    [[ $EUID -eq 0 ]] && return 1
+    command -v sudo >/dev/null 2>&1 || return 1
+    sudo -n true >/dev/null 2>&1
+}
+
+# Sets MTR_HOPS and MTR_TARGET_LOSS from whichever report format we got.
+# Only the target is treated as a measurement of the link.
+extract_mtr_facts() {
+    local out="$1" mode="$2" n="" loss=""
+
+    MTR_HOPS=""
+    MTR_TARGET_LOSS=""
+
+    if [[ "$mode" == "json" ]] && command -v jq >/dev/null 2>&1; then
+        if jq -e '.report.hubs' "$out" >/dev/null 2>&1; then
+            n="$(jq -r '.report.hubs | length' "$out" 2>/dev/null)"
+            loss="$(jq -r '.report.hubs[-1]["Loss%"] // empty' "$out" 2>/dev/null)"
+        fi
+    fi
+    if [[ -z "$n" ]]; then
+        # Plain report: rows start with "<n>.|--"; the last row is the target.
+        n="$(awk '/^[[:space:]]*[0-9]+\./ {last=$3; c++} END {print c" "last}' \
+             "$out" 2>/dev/null)"
+        loss="$(printf '%s\n' "$n" | awk '{print $2}')"
+        n="$(printf '%s\n' "$n" | awk '{print $1}')"
+        loss="${loss%\%}"
+    else
+        loss="${loss%\%}"
+    fi
+    [[ -n "$n" && "$n" != "0" ]] && MTR_HOPS="$n"
+    [[ -n "$loss" ]] && MTR_TARGET_LOSS="$loss"
+    return 0
+}
+
+run_mtr_test() {
+    local target="$1" family="$2" out="$WORKDIR/mtr.out"
+    local jflag=""
+
+    MTR_STATUS="unavailable"
+    MTR_MODE=""
+
+    if ! command -v mtr >/dev/null 2>&1; then
+        return 1
+    fi
+
+    info "Tracing the route with ${MTR_CYCLES} cycles ..."
+    jflag="$(mtr_json_flag)"
+
+    if [[ -n "$jflag" ]]; then
+        timeout 60 mtr -r -c "$MTR_CYCLES" "$jflag" "$target" >"$out" 2>&1 || true
+        if [[ ! -s "$out" ]] && mtr_can_use_sudo; then
+            timeout 60 sudo -n mtr -r -c "$MTR_CYCLES" "$jflag" "$target" >"$out" 2>&1 || true
+        fi
+        [[ -s "$out" ]] && MTR_MODE="json"
+    fi
+
+    if [[ ! -s "$out" ]]; then
+        # Missing JSON support must never stop the overall test: fall back to
+        # the plain text report.
+        if [[ -n "$jflag" ]]; then
+            info "JSON output produced nothing, falling back to the plain text report."
+        fi
+        MTR_MODE="text"
+        timeout 60 mtr -r -c "$MTR_CYCLES" "$target" >"$out" 2>&1 || true
+        if [[ ! -s "$out" ]] && mtr_can_use_sudo; then
+            timeout 60 sudo -n mtr -r -c "$MTR_CYCLES" "$target" >"$out" 2>&1 || true
+        fi
+    fi
+
+    if [[ ! -s "$out" ]]; then
+        MTR_STATUS="filtered"
+        return 1
+    fi
+
+    MTR_STATUS="ok"
+    extract_mtr_facts "$out" "$MTR_MODE"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Steps 4 and 5: iperf3
+# ---------------------------------------------------------------------------
+
+iperf3_has_option() {
+    iperf3_help | grep -q -- "$1"
+}
+
+# Runs one iperf3 test and echoes "<mbps> <retransmits|n/a> <seconds|n/a>".
+# On failure it echoes the error message and returns non-zero, so the caller
+# can continue with the other direction.
+run_iperf3_test() {
+    local label="$1" out="$2" reverse="$3"
+    local -a args=(-c "$RESOLVED_ADDR" -p "$A_PORT" -t "$IPERF_DURATION")
+    local err="" jbps="" retr="" secs="" mbps=""
+
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        printf 'iperf3 is not available\n'
+        return 1
+    fi
+
+    # -O (--omit) is not present in every iperf3 build; degrade instead of fail.
+    # Use the short form when it is advertised together with --omit, and fall
+    # back to the long form when only that is listed.
+    if iperf3_help | grep -qE -- '-O, *--omit'; then
+        args+=(-O "$IPERF_OMIT")
+    elif iperf3_has_option -- '--omit'; then
+        args+=(--omit "$IPERF_OMIT")
+    fi
+    if [[ "$reverse" == "reverse" ]]; then
+        args+=(-R)
+    fi
+    args+=(-J)
+
+    # Progress goes to stderr: stdout carries only the parsed result, so the
+    # caller can capture it with $(...).
+    printf '%sMeasuring %s (%ss, single TCP stream) ...%s\n' \
+        "$C_DIM" "$label" "$IPERF_DURATION" "$C_RESET" >&2
+    timeout 60 iperf3 "${args[@]}" >"$out" 2>&1
+    local rc=$?
+    [[ -s "$out" ]] || printf 'iperf3: error - exited with code %s and produced no output\n' "$rc" >"$out"
+
+    # A connection failure usually shows up as plain text on stderr, not JSON.
+    if ! jq -e . "$out" >/dev/null 2>&1; then
+        err="$(grep -E 'iperf3: error|unable to connect|Connection refused|timed out' \
+               "$out" 2>/dev/null | head -n 1)"
+        [[ -n "$err" ]] || err="iperf3 exited with code ${rc} and produced no JSON"
+        printf '%s\n' "$err"
+        return 1
+    fi
+
+    err="$(jq -r '.error // empty' "$out" 2>/dev/null)"
+    if [[ -n "$err" ]]; then
+        printf '%s\n' "$err"
+        return 1
+    fi
+
+    jbps="$(jq -r '
+        [ .end.sum.bits_per_second,
+          .end.sum_received.bits_per_second,
+          .end.sum_sent.bits_per_second ] | map(select(. != null)) | first // empty
+    ' "$out" 2>/dev/null)"
+    if [[ -z "$jbps" || "$jbps" == "null" ]]; then
+        printf 'iperf3: error - no throughput value found in the JSON result\n'
+        return 1
+    fi
+
+    retr="$(jq -r '
+        [ .end.sum_sent.retransmits, .end.sum.retransmits ] | map(select(. != null)) | first // empty
+    ' "$out" 2>/dev/null)"
+    secs="$(jq -r '.end.sum.seconds // empty' "$out" 2>/dev/null)"
+
+    mbps="$(awk -v b="$jbps" 'BEGIN { printf "%.1f", b / 1000000 }')"
+    printf '%s %s %s\n' "$mbps" "${retr:-n/a}" "${secs:-n/a}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The B mode sequence
+# ---------------------------------------------------------------------------
+
+step_header() {
+    printf '\n%sStep %s/7  %s%s\n' "${C_BOLD}" "$1" "$2" "${C_RESET}"
+}
+
 run_mode_b() {
-    dim "B mode is not implemented in this milestone yet."
-    dim "It will ask for the A address and port, then run the full test sequence."
+    local target="" port="" stepout="" rc=0
+
+    printf '\n'
+    printf '%sB mode%s\n' "${C_BOLD}" "${C_RESET}"
+    rule
+
+    target="$(read_line "Address of the other VPS (IPv4, IPv6 or hostname): ")"
+    if [[ -z "$target" ]]; then
+        warn "No address given."
+        return 1
+    fi
+    port="$(read_line "Temporary port shown by A mode: ")"
+    if ! validate_port "$port"; then
+        fail "'${port}' is not a valid TCP port (expected 1-65535)."
+        return 1
+    fi
+    A_PORT="$port"
+
+    step_header 1 "Connectivity preparation"
+    if ! resolve_target "$target"; then
+        return 1
+    fi
+    A_PORT="$port"
+    info "  Target        ${RESOLVED_ADDR}"
+    info "  Protocol      ${RESOLVED_FAMILY}"
+    info "  Port          ${A_PORT}"
+    local missing=() c
+    for c in ping mtr iperf3 jq; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        warn "  Not available : ${missing[*]}"
+        info "  Those steps will be reported as unavailable, not fatal."
+    else
+        info "  Tools         all required commands present"
+    fi
+
+    step_header 2 "Ping"
+    run_ping_test "$RESOLVED_ADDR" "$RESOLVED_FAMILY"
+    case "$PING_STATUS" in
+        ok)
+            info "  Packet loss   ${PING_LOSS} %"
+            info "  Min / avg / max   ${PING_MIN} / ${PING_AVG} / ${PING_MAX} ms"
+            info "  RTT variation     ${PING_MDEV} ms"
+            ;;
+        loss)
+            info "  Packet loss   ${PING_LOSS} % (no RTT samples)"
+            ;;
+        *)
+            warn "  Ping          unavailable / filtered"
+            ;;
+    esac
+
+    step_header 3 "MTR"
+    run_mtr_test "$RESOLVED_ADDR" "$RESOLVED_FAMILY"
+    case "$MTR_STATUS" in
+        ok)
+            info "  Report mode   ${MTR_MODE} (${MTR_CYCLES} cycles)"
+            info "  Hops          ${MTR_HOPS:-unknown}"
+            info "  Target loss   ${MTR_TARGET_LOSS:-unknown} %"
+            dim  "  Intermediate hops are not treated as link loss."
+            ;;
+        filtered)
+            warn "  MTR           unavailable / filtered"
+            ;;
+        *)
+            warn "  MTR           unavailable"
+            ;;
+    esac
+
+    step_header 4 "TCP throughput B -> A"
+    rc=0
+    stepout="$(run_iperf3_test "B -> A" "${WORKDIR}/iperf3-b-to-a.json" normal)" || rc=1
+    if [[ $rc -eq 0 ]]; then
+        read -r IPERF_BA_MBPS IPERF_BA_RETRANS IPERF_BA_SECONDS <<<"$stepout"
+        IPERF_BA_STATUS="ok"
+        info "  Observed TCP throughput   ${IPERF_BA_MBPS} Mbps"
+        info "  Retransmits               ${IPERF_BA_RETRANS} in ${IPERF_BA_SECONDS}s"
+    else
+        IPERF_BA_STATUS="error"
+        IPERF_BA_ERROR="$(printf '%s\n' "$stepout" | head -n 1)"
+        warn "  B -> A throughput failed: ${IPERF_BA_ERROR}"
+        info ""
+        info "Possible causes:"
+        info "  - Local firewall"
+        info "  - Cloud security group"
+        info "  - Provider ACL"
+        info "  - NAT / CGNAT"
+        info "  - Incorrect address or port"
+    fi
+info "  Status         ${IPERF_BA_STATUS}"
+
+    step_header 5 "TCP throughput A -> B"
+    rc=0
+    stepout="$(run_iperf3_test "A -> B" "${WORKDIR}/iperf3-a-to-b.json" reverse)" || rc=1
+    if [[ $rc -eq 0 ]]; then
+        read -r IPERF_AB_MBPS IPERF_AB_RETRANS IPERF_AB_SECONDS <<<"$stepout"
+        IPERF_AB_STATUS="ok"
+        info "  Observed TCP throughput   ${IPERF_AB_MBPS} Mbps"
+        info "  Retransmits               ${IPERF_AB_RETRANS} in ${IPERF_AB_SECONDS}s"
+    else
+        IPERF_AB_STATUS="error"
+        IPERF_AB_ERROR="$(printf '%s\n' "$stepout" | head -n 1)"
+        warn "  A -> B throughput failed: ${IPERF_AB_ERROR}"
+        info ""
+        info "Possible causes:"
+        info "  - Local firewall"
+        info "  - Cloud security group"
+        info "  - Provider ACL"
+        info "  - NAT / CGNAT"
+        info "  - Incorrect address or port"
+    fi
+info "  Status         ${IPERF_AB_STATUS}"
+
+    step_header 6 "Analyze"
+    info "  Results captured; the parser and report layer come next."
+
+    step_header 7 "Report"
+    info "  Raw files for this run are kept in ${WORKDIR}."
     return 0
 }
 
