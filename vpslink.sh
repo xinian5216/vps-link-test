@@ -136,25 +136,32 @@ init_workdir() {
     WORKDIR="$(mktemp -d "${base}/vps-link-test-XXXXXXXX" 2>/dev/null)" || return 1
     WORKDIR_MARKER="${WORKDIR}/.vpslink-owned"
     : >"$WORKDIR_MARKER" 2>/dev/null || return 1
+
+    # Never continue with a directory we cannot safely identify again in
+    # cleanup; that would leave files behind.
+    [[ "$WORKDIR" == "${base}/vps-link-test-"* ]] || return 1
     return 0
 }
 
 # Terminates only the iperf3 process this script started (never a
 # blanket pkill/killall, which could take down an unrelated service).
 stop_iperf3_server() {
-    if [[ -n "$IPERF3_PID" ]] && kill -0 "$IPERF3_PID" 2>/dev/null; then
+    local i=0
+    if [[ -n "${IPERF3_PID:-}" ]] && kill -0 "$IPERF3_PID" 2>/dev/null; then
         kill "$IPERF3_PID" 2>/dev/null || true
-        # Give it a moment to exit on its own, then make sure it is gone.
-        for _ in 1 2 3 4 5 6 7 8 9 10; do
-            kill -0 "$IPERF3_PID" 2>/dev/null || break
+        # Give it up to two seconds to exit on its own, then force it.
+        while kill -0 "$IPERF3_PID" 2>/dev/null && [[ $i -lt 10 ]]; do
             sleep 0.2
+            i=$((i + 1))
         done
         if kill -0 "$IPERF3_PID" 2>/dev/null; then
             kill -9 "$IPERF3_PID" 2>/dev/null || true
         fi
+        # Reap it so no zombie is left behind.
         wait "$IPERF3_PID" 2>/dev/null || true
     fi
     IPERF3_PID=""
+    return 0
 }
 
 cleanup() {
@@ -162,19 +169,37 @@ cleanup() {
     trap - EXIT INT TERM
 
     stop_iperf3_server
-
-    # Only delete a directory this run actually created and marked.
-    if [[ -n "$WORKDIR" && -n "$WORKDIR_MARKER" && -f "$WORKDIR_MARKER" ]]; then
-        rm -rf -- "$WORKDIR" 2>/dev/null || true
-    fi
-    WORKDIR=""
-    WORKDIR_MARKER=""
+    remove_workdir
 
     return "$rc"
 }
 
+# Removes the scratch directory of THIS run and nothing else.
+#
+# Three independent conditions must all hold before anything is deleted:
+#   1. the directory actually contains the marker file this run wrote
+#   2. it is a directory, and not a symlink to one
+#   3. its name matches the vps-link-test-* prefix
+# That makes it impossible to delete someone else's files, a symlinked /tmp,
+# or the whole of /tmp.
+remove_workdir() {
+    if [[ -n "${WORKDIR:-}" && -n "${WORKDIR_MARKER:-}" && -f "$WORKDIR_MARKER" ]] \
+       && [[ -d "$WORKDIR" && ! -L "$WORKDIR" ]] \
+       && [[ "$WORKDIR" == *"/vps-link-test-"* ]]; then
+        rm -rf -- "$WORKDIR" 2>/dev/null || true
+    fi
+    WORKDIR=""
+    WORKDIR_MARKER=""
+    return 0
+}
+
 install_traps() {
+    # Coverage for every exit path. INT and TERM are bound to exit first so
+    # that a Ctrl+C stops the script immediately instead of resuming right
+    # after the trap; the EXIT trap then runs cleanup exactly once.
     trap cleanup EXIT INT TERM
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 }
 
 # ---------------------------------------------------------------------------
@@ -564,7 +589,14 @@ offer_dependency_removal() {
 # ---------------------------------------------------------------------------
 
 is_ipv4() {
-    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+    local ip="$1" v
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    # Shape alone would accept 203.0.113.999; every octet must be a real byte.
+    for v in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+             "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+        (( 10#$v <= 255 )) || return 1
+    done
+    return 0
 }
 
 is_ipv6_literal() {
@@ -585,31 +617,71 @@ local_ipv6() {
         | grep -v '^fe80:' | head -n 1
 }
 
+# Public IP detection is best effort only. An unreachable detection service is
+# never an error: the user is simply asked to type the address instead.
 detect_public_ips() {
-    local out=""
+    local url=""
 
-    if command -v curl >/dev/null 2>&1; then
-        out="$(curl -4 -fsS --connect-timeout 3 --max-time 5 \
-               https://api.ipify.org 2>/dev/null | tr -d '[:space:]')"
-        if ! is_ipv4 "$out"; then
-            out="$(curl -4 -fsS --connect-timeout 3 --max-time 5 \
-                   https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]')"
-        fi
-        if is_ipv4 "$out"; then
-            PUBLIC_IPV4="$out"
-        fi
-
-        out="$(curl -6 -fsS --connect-timeout 3 --max-time 5 \
-               https://api64.ipify.org 2>/dev/null | tr -d '[:space:]')"
-        if ! is_ipv6_literal "$out"; then
-            out="$(curl -6 -fsS --connect-timeout 3 --max-time 5 \
-                   https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]')"
-        fi
-        if is_ipv6_literal "$out"; then
-            PUBLIC_IPV6="$out"
-        fi
+    if [[ -n "${VPSLINK_SKIP_IP_DETECT:-}" ]]; then
+        return 0
     fi
+    if ! command -v curl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Try a few independent services so one outage does not blind us.
+    for url in https://api.ipify.org https://ipv4.icanhazip.com \
+               https://ifconfig.me/ip https://ipinfo.io/ip; do
+        [[ "$PUBLIC_IPV4" != "unavailable" ]] && break
+        if public_ip_lookup "-4" "$url"; then
+            PUBLIC_IPV4="$public_ip_result"
+        fi
+    done
+
+    for url in https://api64.ipify.org https://ipv6.icanhazip.com \
+               https://ifconfig.co/ip; do
+        [[ "$PUBLIC_IPV6" != "unavailable" ]] && break
+        if public_ip_lookup "-6" "$url"; then
+            PUBLIC_IPV6="$public_ip_result"
+        fi
+    done
+
     return 0
+}
+
+# public_ip_lookup <family-flag> <url> -> sets $public_ip_result on success
+public_ip_lookup() {
+    local family="$1" url="$2" out=""
+    public_ip_result=""
+
+    out="$(curl "$family" -fsS --connect-timeout 3 --max-time 5 \
+           "$url" 2>/dev/null | tr -d '[:space:]')"
+
+    if [[ "$family" == "-4" ]]; then
+        is_ipv4 "$out" || return 1
+    else
+        is_ipv6_literal "$out" || return 1
+    fi
+    public_ip_result="$out"
+    return 0
+}
+
+# A usable address to hand to B: the detected public one, otherwise whatever
+# local address this side actually has. Never invents one.
+local_hint_ipv4() {
+    is_ipv4 "${PUBLIC_IPV4:-}" && { printf '%s\n' "$PUBLIC_IPV4"; return 0; }
+    local v4=""
+    v4="$(local_ipv4)"
+    [[ -n "$v4" ]] || return 1
+    printf '%s\n' "$v4"
+}
+
+local_hint_ipv6() {
+    is_ipv6_literal "${PUBLIC_IPV6:-}" && { printf '%s\n' "$PUBLIC_IPV6"; return 0; }
+    local v6=""
+    v6="$(local_ipv6)"
+    [[ -n "$v6" ]] || return 1
+    printf '%s\n' "$v6"
 }
 
 # ---------------------------------------------------------------------------
@@ -917,13 +989,21 @@ run_mode_a() {
     local addr_v4="$PUBLIC_IPV4" addr_v6="$PUBLIC_IPV6" answer=""
 
     if [[ "$addr_v4" == "unavailable" ]]; then
+        local hint4="" hint6=""
+        hint4="$(local_hint_ipv4 || true)"
+        hint6="$(local_hint_ipv6 || true)"
         info "The public IPv4 address could not be detected automatically."
-        info "(The detection service may simply be unreachable from this VPS.)"
+        info "(A detection service may simply be unreachable from this VPS.)"
+        [[ -n "$hint4" ]] && info "  Local address on this machine: ${hint4}"
+        [[ -n "$hint6" ]] && info "  Local IPv6 address:          ${hint6}"
         answer="$(read_line "Enter the IPv4 address B should use, or leave blank to skip: ")"
         [[ -n "$answer" ]] && addr_v4="$answer"
     fi
     if [[ "$addr_v6" == "unavailable" ]]; then
+        local hint6=""
+        hint6="$(local_hint_ipv6 || true)"
         info "The public IPv6 address could not be detected automatically."
+        [[ -n "$hint6" ]] && info "  Local address on this machine: ${hint6}"
         answer="$(read_line "Enter the IPv6 address B should use, or leave blank to skip: ")"
         [[ -n "$answer" ]] && addr_v6="$answer"
     fi
