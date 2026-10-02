@@ -26,3 +26,13 @@ desktop.ini
 /tmp/
 /CACHEDIR.TAG
 dev-check.sh
+dev-deps.sh
+dev-deps2.sh
+dev-mode-a.sh
+dev-mode-a-e2e.sh
+splice-a.sh
+splice-a.py
+patch-lf.py
+dedupe.py
+dbg*.sh
+run-*.log

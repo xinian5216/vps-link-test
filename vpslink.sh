@@ -695,9 +695,7 @@ main_menu() {
         case "$choice" in
             1)
                 info ""
-                if mode_a_placeholder; then
-                    :
-                fi
+                run_mode_a
                 press_enter
                 ;;
             2)
@@ -720,9 +718,267 @@ main_menu() {
     done
 }
 
-mode_a_placeholder() {
-    dim "A mode is not implemented in this milestone yet."
-    dim "It will start a temporary one-off iperf3 server and print the port."
+# ---------------------------------------------------------------------------
+# A mode - a temporary one-off iperf3 server
+#
+# Nothing here touches an existing iperf3 instance, an existing listener or any
+# firewall. The port is picked from a free high range, and the only process ever
+# signalled is the one started below.
+#
+# iperf3's server, with no explicit --bind, creates an AF_INET6 socket with
+# IPV6_V6ONLY=0, i.e. one dual-stack listener that accepts IPv4 and IPv6
+# clients alike. If the kernel has no IPv6 support, netannounce() falls back to
+# an IPv4 wildcard socket. Either way we verify what actually got bound with
+# "ss" before advertising an address, instead of assuming.
+# ---------------------------------------------------------------------------
+
+A_PORT_MIN=30000
+A_PORT_MAX=50000
+A_ROUND_1_TIMEOUT=600        # first session: wait up to ~10 minutes
+A_ROUND_2_TIMEOUT=180        # second session: wait up to ~3 minutes
+
+A_LISTEN_IPV4=0
+A_LISTEN_IPV6=0
+
+IPERF3_HELP=""
+
+# read_line <prompt> -> prints the answer. The prompt goes to stderr so that
+# command substitution captures only the typed value.
+read_line() {
+    local prompt="$1" line=""
+    printf '%s' "$prompt" >&2
+    IFS= read -r line || line=""
+    printf '%s' "$line"
+}
+
+random_port() {
+    if command -v shuf >/dev/null 2>&1; then
+        shuf -i "${A_PORT_MIN}-${A_PORT_MAX}" -n 1
+    else
+        # shuf is coreutils; this branch is only a belt-and-braces fallback.
+        printf '%s\n' "$(( (RANDOM % (A_PORT_MAX - A_PORT_MIN + 1)) + A_PORT_MIN ))"
+    fi
+}
+
+# True when something already listens on that TCP or UDP port.
+port_in_use() {
+    local port="$1" tcp_addrs="" udp_addrs=""
+
+    if command -v ss >/dev/null 2>&1; then
+        tcp_addrs="$(ss -tln 2>/dev/null | awk -v p="$port" 'NR>1 && $4 ~ "[:.]"p"$" {print $4}')"
+        [[ -n "$tcp_addrs" ]] && return 0
+        udp_addrs="$(ss -uln 2>/dev/null | awk -v p="$port" 'NR>1 && $4 ~ "[:.]"p"$" {print $4}')"
+        [[ -n "$udp_addrs" ]] && return 0
+        return 1
+    fi
+
+    # No ss available: probe the loopback port instead of guessing blindly.
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+find_free_port() {
+    local tries=0 port=""
+    while [[ $tries -lt 64 ]]; do
+        port="$(random_port)"
+        if ! port_in_use "$port"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+# Which address families did our server actually bind? Decided from "ss", not
+# from assumptions, so an IPv4-only or IPv6-only host is reported correctly.
+listen_families() {
+    local port="$1" addrs=""
+    A_LISTEN_IPV4=0
+    A_LISTEN_IPV6=0
+
+    command -v ss >/dev/null 2>&1 || return 0
+    addrs="$(ss -tln 2>/dev/null | awk -v p="$port" 'NR>1 && $4 ~ "[:.]"p"$" {print $4}')"
+    [[ -n "$addrs" ]] || return 0
+
+    # iperf3 -s (no --bind) asks for AF_UNSPEC, which netannounce() turns into
+    # an AF_INET6 socket with IPV6_V6ONLY=0. Such a socket shows up in ss as a
+    # wildcard and accepts IPv4 clients as well as IPv6 ones, so a wildcard row
+    # has to be counted as both families. A concrete [2001:db8::1] row would be
+    # a genuine IPv6-only bind and is counted as IPv6 alone.
+    if printf '%s\n' "$addrs" | grep -qE '^(\[::\]|\*):'; then
+        A_LISTEN_IPV4=1
+        A_LISTEN_IPV6=1
+        return 0
+    fi
+
+    # Concrete rows: IPv6 rows are bracketed, IPv4 rows never are.
+    if printf '%s\n' "$addrs" | grep -q '^\['; then
+        A_LISTEN_IPV6=1
+    fi
+    if printf '%s\n' "$addrs" | grep -vq '^\['; then
+        A_LISTEN_IPV4=1
+    fi
+    return 0
+}
+
+iperf3_help() {
+    if [[ -z "$IPERF3_HELP" ]]; then
+        IPERF3_HELP="$(iperf3 -h 2>&1 || true)"
+    fi
+    printf '%s' "$IPERF3_HELP"
+}
+
+iperf3_supports() {
+    iperf3_help | grep -q -- "$1"
+}
+
+# start_iperf3_server <port> <logfile> <idle-timeout-seconds>
+start_iperf3_server() {
+    local port="$1" log="$2" idle="$3"
+    local args=(-s -1 -p "$port")
+
+    # --idle-timeout makes a one-off server exit by itself when no client shows
+    # up; a second line of defence even if this script is SIGKILLed.
+    if iperf3_supports -- '--idle-timeout'; then
+        args+=(--idle-timeout "$idle")
+    fi
+
+    iperf3 "${args[@]}" >"$log" 2>&1 &
+    IPERF3_PID=$!
+
+    sleep 1
+    if ! kill -0 "$IPERF3_PID" 2>/dev/null; then
+        fail "The temporary iperf3 server exited immediately."
+        warn "Last lines of its output:"
+        tail -n 6 "$log" 2>/dev/null
+        IPERF3_PID=""
+        return 1
+    fi
+    return 0
+}
+
+# Waits for the single client session this one-off server accepts.
+# Hard deadline: never returns later than <timeout_s> seconds plus one.
+wait_for_one_off_session() {
+    local label="$1" timeout_s="$2" log="$3" waited=0 next_notice=60 rc=0
+
+    info "Waiting for B (${label}) - up to ${timeout_s}s."
+    dim  "Ctrl+C stops immediately and removes the listener."
+
+    while kill -0 "$IPERF3_PID" 2>/dev/null; do
+        if [[ $waited -ge $timeout_s ]]; then
+            warn "No client session within ${timeout_s}s."
+            stop_iperf3_server
+            return 1
+        fi
+        if [[ $waited -ge $next_notice ]]; then
+            info "  still waiting... ${waited}s elapsed of ${timeout_s}s"
+            next_notice=$((waited + 60))
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    wait "$IPERF3_PID" 2>/dev/null
+    rc=$?
+    IPERF3_PID=""
+
+    if [[ $rc -ne 0 ]]; then
+        warn "iperf3 server reported an error (exit code ${rc})."
+        tail -n 6 "$log" 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+
+print_server_summary() {
+    local log="$1"
+    [[ -s "$log" ]] || return 0
+    info "Server side saw:"
+    grep -E 'Accepted connection' "$log" 2>/dev/null | tail -n 1
+    # The closing "Interval ... Transfer ... Bitrate" line is the measurement.
+    grep -E 'sec[[:space:]]+[0-9.]+[[:space:]]+[MKG]Bytes' "$log" 2>/dev/null | tail -n 1
+    return 0
+}
+
+run_mode_a() {
+    if ! command -v iperf3 >/dev/null 2>&1; then
+        fail "iperf3 is not available, so A mode cannot start a server."
+        info "Re-run this script and accept the dependency installation, or"
+        info "install iperf3 yourself, then choose A mode again."
+        return 1
+    fi
+
+    local addr_v4="$PUBLIC_IPV4" addr_v6="$PUBLIC_IPV6" answer=""
+
+    if [[ "$addr_v4" == "unavailable" ]]; then
+        info "The public IPv4 address could not be detected automatically."
+        info "(The detection service may simply be unreachable from this VPS.)"
+        answer="$(read_line "Enter the IPv4 address B should use, or leave blank to skip: ")"
+        [[ -n "$answer" ]] && addr_v4="$answer"
+    fi
+    if [[ "$addr_v6" == "unavailable" ]]; then
+        info "The public IPv6 address could not be detected automatically."
+        answer="$(read_line "Enter the IPv6 address B should use, or leave blank to skip: ")"
+        [[ -n "$answer" ]] && addr_v6="$answer"
+    fi
+
+    if ! A_PORT="$(find_free_port)"; then
+        fail "Could not find a free TCP port in ${A_PORT_MIN}-${A_PORT_MAX}."
+        info " Something is wrong with this host's port allocation."
+        return 1
+    fi
+
+    local log1="${WORKDIR}/iperf3-server-1.log"
+    local log2="${WORKDIR}/iperf3-server-2.log"
+
+    # ---- first session: B -> A -------------------------------------------
+    if ! start_iperf3_server "$A_PORT" "$log1" "$A_ROUND_1_TIMEOUT"; then
+        return 1
+    fi
+    listen_families "$A_PORT"
+
+    printf '\n%sA mode ready%s\n\n' "${C_BOLD}" "${C_RESET}"
+    if [[ "$A_LISTEN_IPV4" -eq 1 ]]; then
+        printf 'IPv4:\n%s\n\n' "$addr_v4"
+    else
+        printf 'IPv4:\n%s\n\n' "not available on this server"
+    fi
+    if [[ "$A_LISTEN_IPV6" -eq 1 ]]; then
+        printf 'IPv6:\n%s\n\n' "$addr_v6"
+    else
+        printf 'IPv6:\n%s\n\n' "not available on this server"
+    fi
+    printf 'Port:\n%s\n\n' "$A_PORT"
+
+    info "On the other VPS choose 'B mode' and enter the address above plus this port."
+    info "Two tests are expected: B -> A first, then A -> B."
+    printf '\n'
+
+    if ! wait_for_one_off_session "session 1, B -> A" "$A_ROUND_1_TIMEOUT" "$log1"; then
+        return 1
+    fi
+    print_server_summary "$log1"
+
+    # ---- second session: A -> B, on a fresh one-off server ---------------
+    printf '\n'
+    info "Session 1 finished. Starting a fresh one-off server for session 2."
+    if ! start_iperf3_server "$A_PORT" "$log2" "$A_ROUND_2_TIMEOUT"; then
+        return 1
+    fi
+    if ! wait_for_one_off_session "session 2, A -> B" "$A_ROUND_2_TIMEOUT" "$log2"; then
+        warn "Session 2 did not complete; A mode is stopping anyway."
+        return 1
+    fi
+    print_server_summary "$log2"
+
+    printf '\n'
+    ok "A mode finished. Both sessions are done."
     return 0
 }
 
