@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# ---------------------------------------------------------------------------
+# Local run artefacts of vpslink.sh
+# The script itself only ever writes into /tmp/vps-link-test-XXXXXXXX/ which
+# is removed on exit, so nothing should normally land here.
+# ---------------------------------------------------------------------------
+*.log
+*.tmp
+*.json.bak
+
+# ---------------------------------------------------------------------------
+# Local scratch
+# ---------------------------------------------------------------------------
+/tmp/
+/CACHEDIR.TAG
+dev-check.sh
