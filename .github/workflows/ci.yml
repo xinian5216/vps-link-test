@@ -3,12 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No path filter: every pull request must get the full CI run, including
+  # docs-only changes, because "CI passes" is a merge requirement.
   pull_request:
     branches: [main]
-    paths:
-      - 'vpslink.sh'
-      - 'tests/**'
-      - '.github/workflows/**'
 
 permissions:
   contents: read
