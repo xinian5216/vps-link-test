@@ -1,0 +1,21 @@
+# Force LF line endings everywhere.
+#
+# vpslink.sh is a Bash script: CRLF endings make it fail with confusing
+# "command not found" / $'\r' errors when run on a Linux VPS. This file
+# protects the repository from Windows checkouts silently rewriting them.
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.bash text eol=lf
+*.yml text eol=yaml
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Binary fixtures must never be touched.
+*.png binary
+*.jpg binary
